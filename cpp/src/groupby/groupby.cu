@@ -51,6 +51,12 @@ groupby::groupby(table_view const& keys,
 }
 
 // Select hash vs. sort groupby implementation
+// CALL-GRAPH NOTE: This is the primary dispatch point reached from groupby::aggregate().
+// - Hash path (detail::hash::groupby): taken when keys are unsorted, no sort_helper exists yet,
+//   AND all requested aggregations are hash-compatible (SUM, MIN, MAX, COUNT, MEAN, etc.).
+//   See hash/groupby.cu → can_use_hash_groupby() for the full list.
+// - Sort path (sort_aggregate): taken for aggs like COLLECT_LIST, QUANTILE, RANK, or when
+//   the groupby object has already been used in sort mode (_helper is set).
 std::pair<std::unique_ptr<table>, std::vector<aggregation_result>> groupby::dispatch_aggregation(
   host_span<aggregation_request const> requests,
   rmm::cuda_stream_view stream,
@@ -64,6 +70,7 @@ std::pair<std::unique_ptr<table>, std::vector<aggregation_result>> groupby::disp
   // satisfied with a hash implementation
   if (_keys_are_sorted == sorted::NO and not _helper and
       detail::hash::can_use_hash_groupby(requests)) {
+    // CALL-GRAPH: SUM on a fixed-width numeric type → hash path taken here.
     return detail::hash::groupby(_keys, requests, _include_null_keys, stream, mr);
   } else {
     return sort_aggregate(requests, stream, mr);
@@ -220,6 +227,14 @@ void verify_valid_requests(host_span<RequestType const> requests)
 }  // namespace
 
 // Compute aggregation requests
+// CALL-GRAPH ENTRY POINT: This is the first function called by user code.
+// Flow for `gb.aggregate(requests, stream, mr)` with SUM on numeric columns:
+//   1. Validate sizes and types (CPU only).
+//   2. Call dispatch_aggregation() → decides hash vs sort path.
+//   3. Hash path: detail::hash::groupby() → dispatch_groupby() → compute_groupby()
+//       → compute_single_pass_aggs() → [KERNEL 1] mapping_indices_kernel
+//                                    → [KERNEL 2] single_pass_shmem_aggs_kernel  (or global fallback)
+//       → cudf::detail::gather() for unique key rows.
 std::pair<std::unique_ptr<table>, std::vector<aggregation_result>> groupby::aggregate(
   host_span<aggregation_request const> requests,
   rmm::cuda_stream_view stream,

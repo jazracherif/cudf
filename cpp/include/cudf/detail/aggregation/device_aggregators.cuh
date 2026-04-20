@@ -96,6 +96,20 @@ struct update_target_element<Source, aggregation::MAX> {
   }
 };
 
+// CALL-GRAPH NOTE: This specialization is the innermost function for the groupby SUM path.
+// Called from both the shared-memory and global-memory aggregation kernels via:
+//   shmem_element_aggregator / gmem_element_aggregator
+//     → dispatch_type_and_aggregation(T, SUM, ...)
+//       → update_target_element<Source, SUM>::operator()
+//
+// The atomic_add call here is the final CUDA primitive that accumulates partial sums.
+// - In the shmem path (Phase 1):  target points into a dynamic __shared__ byte buffer.
+// - In the shmem path (Phase 2):  target points into the RMM-backed output column device buffer.
+// - In the global memory fallback: same as Phase 2, but called directly per input row.
+//
+// target_type_t<Source, SUM>: widens integers to avoid overflow, e.g., int32 → int64.
+//   Floating-point types are NOT widened: float → float, double → double.
+// cudf::detail::atomic_add: thin wrapper around CUDA's atomicAdd() intrinsic.
 template <typename Source>
   requires(cudf::is_fixed_width<Source>() && cudf::has_atomic_support<Source>() &&
            !cudf::is_fixed_point<Source>() && !cudf::is_timestamp<Source>())

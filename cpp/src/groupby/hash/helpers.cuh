@@ -84,6 +84,22 @@ using nullable_row_comparator_t = cudf::detail::row::equality::device_row_compar
   cudf::nullate::DYNAMIC,
   cudf::detail::row::equality::nan_equal_physical_equality_comparator>;
 
+// CALL-GRAPH NOTE: Key type aliases used throughout the hash groupby implementation.
+//
+// global_set_t / nullable_global_set_t:
+//   The cuco::static_set instantiation used as the global unique-key registry.
+//   Stores size_type row indices. Both non-nullable and nullable variants share the same
+//   probing_scheme_t but differ in their row equality comparator.
+//
+// probing_scheme_t = cuco::linear_probing<1, row_hasher_with_cache_t>:
+//   CG size 1 means each thread handles one probe chain independently (no cooperative groups).
+//   row_hasher_with_cache_t wraps the cudf row hasher and optionally reads from a cached
+//   hash array (rmm::device_uvector) to avoid recomputing hashes.
+//
+// hash_set_ref_t / nullable_hash_set_ref_t:
+//   Lightweight reference views into the global_set_t used inside CUDA kernels.
+//   The shared-memory variant in mapping_indices_kernel uses cuco::static_set_ref directly
+//   (not these aliases) with thread_scope_block and storage in __shared__ arrays.
 using global_set_t = cuco::static_set<cudf::size_type,
                                       cuco::extent<int64_t>,
                                       cuda::thread_scope_device,

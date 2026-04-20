@@ -83,11 +83,38 @@ __device__ void find_global_mapping(cooperative_groups::thread_block const& bloc
 }
 
 /*
- * @brief Inserts keys into the shared memory hash set, and stores the block-wise rank for a given
- * row index in `local_mapping_indices`. If the number of unique keys found in a threadblock exceeds
- * `GROUPBY_CARDINALITY_THRESHOLD`, the threads in that block will exit without updating
- * `global_set` or setting `global_mapping_indices`. Else, we insert the unique keys found to the
- * global hash set, and save the row index of the global sparse table in `global_mapping_indices`.
+ * @brief [KERNEL 1] mapping_indices_kernel
+ *
+ * CALL-GRAPH NOTE: First CUDA kernel in the shared-memory aggregation path.
+ * Launched by compute_mapping_indices() (compute_mapping_indices.cu) with:
+ *   Grid:  grid_size blocks  (computed from cudaOccupancyMaxActiveBlocksPerMultiprocessor)
+ *   Block: GROUPBY_BLOCK_SIZE = 128 threads
+ *   Shmem: valid_extent slots for the block-scoped cuco::static_set_ref
+ *
+ * Purpose: build two index mapping arrays used by the subsequent aggregation kernel.
+ *
+ * Key data structures:
+ *   __shared__ slots[valid_extent.value()]  → the per-block cuco::static_set_ref storage.
+ *   __shared__ cardinality                  → block-local unique-key counter.
+ *   shared_set_indices[THRESHOLD]           → maps block-rank → input row index.
+ *
+ * Algorithm per block:
+ *   1. Each thread loops over its assigned input rows (stride = grid_stride).
+ *      For each row:
+ *        find_local_mapping() → insert into the block-private shmem set.
+ *          - New row found: cardinality++ (cuda::atomic_ref<thread_scope_block>),
+ *                          local_mapping_indices[row] = block_rank.
+ *          - Existing row: local_mapping_indices[row] = local_mapping_indices[matched_row].
+ *          - cardinality > GROUPBY_CARDINALITY_THRESHOLD=128: set atomic_flag fallback, break.
+ *
+ *   2. find_global_mapping() → insert each block-unique key into the global cuco::static_set
+ *      (thread_scope_device). Result: global_mapping_indices[block*THRESHOLD+rank] = global_key_idx.
+ *
+ * CCCL dependencies:
+ *   - cuco::static_set_ref (cuCollections)  → block-scoped insert_and_find
+ *   - cuda::atomic_ref<thread_scope_block> (libcudacxx) → cardinality counter
+ *   - cuda::std::atomic_flag (libcudacxx)   → fallback signal
+ *   - cooperative_groups::this_thread_block() → block.sync(), block.thread_rank()
  */
 template <class SetRef>
 CUDF_KERNEL void mapping_indices_kernel(size_type num_input_rows,

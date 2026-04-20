@@ -66,6 +66,20 @@ const auto hash_aggregations = std::unordered_set{// Single pass aggregations:
  */
 bool is_hash_aggregation(aggregation::Kind t) { return hash_aggregations.contains(t); }
 
+// CALL-GRAPH NOTE: Called by hash::groupby() after checking nulls.
+// This function builds the two key device callables that the cuco::static_set will use:
+//
+//  preprocessed_keys  - a column-layout-aware view of the keys table enabling stable row hashing
+//                       and equality comparison. Resolves nested struct/list column layouts.
+//
+//  d_row_hash         - device callable, wraps MurmurHash3_x86_32 over a full row by index.
+//                       Wrapped in row_hasher_with_cache_t (helpers.cuh) for optional cached hashes.
+//                       Used as the hash function in cuco::linear_probing.
+//
+//  d_row_equal        - device callable, compares two rows by index for equality.
+//                       nulls treated as equal (null_equality::EQUAL) for groupby semantics.
+//
+// After building these, dispatches to compute_groupby<T>() in compute_groupby.cu.
 std::unique_ptr<table> dispatch_groupby(table_view const& keys,
                                         host_span<aggregation_request const> requests,
                                         cudf::detail::result_cache* cache,
@@ -89,6 +103,7 @@ std::unique_ptr<table> dispatch_groupby(table_view const& keys,
       keys, requests, skip_rows_with_nulls, d_row_equal, d_row_hash, cache, stream, mr);
   } else {
     auto const d_row_equal = comparator.equal_to<false>(has_null, null_keys_are_equal);
+    // CALL-GRAPH: For plain numeric key column (no nested ty    
     return compute_groupby<row_comparator_t>(
       keys, requests, skip_rows_with_nulls, d_row_equal, d_row_hash, cache, stream, mr);
   }
@@ -166,6 +181,14 @@ bool can_use_hash_groupby(host_span<aggregation_request const> requests)
 }
 
 // Hash-based groupby
+// CALL-GRAPH NOTE: Top-level hash groupby function, called from groupby::dispatch_aggregation().
+// Orchestrates three things:
+//   1. result_cache: a host-side map keyed by (column_ptr, agg_kind) that intermediate and final
+//      aggregation result columns are stored in. Filled by compute_single_pass_aggs → finalize_output.
+//   2. dispatch_groupby(): sets up row hasher/comparator, builds cuco::static_set, runs all kernels,
+//      and returns the table of unique key row indices.
+//   3. extract_results(): pulls SUM result columns out of the cache and wraps them into
+//      aggregation_result structs for the caller.
 std::pair<std::unique_ptr<table>, std::vector<aggregation_result>> groupby(
   table_view const& keys,
   host_span<aggregation_request const> requests,

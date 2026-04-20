@@ -35,7 +35,33 @@ std::pair<rmm::device_uvector<size_type>, bool> compute_single_pass_aggs(
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr)
 {
-  // Collect the single-pass aggregations that can be processed in this function.
+  // CALL-GRAPH NOTE: Central aggregation dispatcher.
+  // Called by compute_groupby() after the cuco::static_set is built.
+  //
+  // Step 1 - Decompose requests:
+  //   extract_single_pass_aggs() flattens compound aggs:
+  //     SUM      → [SUM]  (is_agg_intermediate=false)
+  //     MEAN     → [SUM, COUNT_VALID]  (both intermediate)
+  //     STD/VAR  → [SUM_OF_SQUARES, SUM, COUNT_VALID]
+  //
+  // Step 2 - Choose kernel path based on shared memory availability:
+  //   Shared memory path (preferred):
+  //     → [KERNEL 1] mapping_indices_kernel  (compute_mapping_indices.cuh)
+  //         Builds block-local cuco::static_set_ref in __shared__ memory.
+  //         Produces local_mapping_indices[row] = block-rank, and
+  //                  global_mapping_indices[block*THRESHOLD+rank] = global_key_idx.
+  //     → [KERNEL 2] single_pass_shmem_aggs_kernel  (compute_shared_memory_aggs.cu)
+  //         Phase 1: rows → shmem accumulators (atomic_add into shared memory)
+  //         Phase 2: shmem accumulators → global output columns (atomic_add into device mem)
+  //
+  //   Global memory fallback (run_aggs_by_global_mem_kernel):
+  //     Triggered when: dictionary cols present, insufficient shmem, SUM_WITH_OVERFLOW,
+  //     or block cardinality exceeds GROUPBY_CARDINALITY_THRESHOLD=128.
+  //     → compute_global_memory_aggs() → thrust::for_each_n over all rows,
+  //       each row atomically aggregates directly into the output table.
+  //
+  // Returns: (key_gather_map device_uvector, has_compound_aggs flag)
+  //   key_gather_map = unique key row indices for the final gather pass.
   // The compound aggregations that require multiple passes will be handled separately later on.
   auto const [values, agg_kinds, aggs, is_agg_intermediate, has_compound_aggs] =
     extract_single_pass_aggs(requests, stream);

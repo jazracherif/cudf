@@ -168,7 +168,42 @@ __device__ void compute_final_aggregations(cooperative_groups::thread_block cons
 }
 
 /* Takes the local_mapping_index and global_mapping_index to compute
- * pre (shared) and final (global) aggregates*/
+ * pre (shared) and final (global) aggregates
+ *
+ * [KERNEL 2] single_pass_shmem_aggs_kernel
+ * CALL-GRAPH NOTE: Second CUDA kernel in the shared-memory aggregation path.
+ * Launched by compute_shared_memory_aggs() with the same grid shape as mapping_indices_kernel.
+ * Dynamic shared memory = available_shmem_size bytes for per-block partial aggregation buffers.
+ *
+ * Column-batching loop (outer while): because shmem may not fit all aggregation columns at once,
+ * the kernel processes them in batches (calculate_columns_to_aggregate determines batch bounds).
+ *
+ * For each column batch:
+ *   1. initialize_shmem_aggregations():
+ *      Sets each partial slot to the identity for the aggregation kind.
+ *      For SUM: identity = 0.  For COUNT: identity = 0.  For MIN: identity = MAX_VAL.
+ *      Uses dispatch_type_and_aggregation → initialize_shmem{} → initialize_target_element<T,k>.
+ *
+ *   2. compute_pre_aggregations()  → Phase 1 of reduction:
+ *      Each thread strides over input rows (global_thread_id, grid_stride).
+ *      For valid rows: target_idx = local_mapping_indices[row] + agg_location_offset.
+ *      Calls shmem_element_aggregator → update_target_element<T, SUM> →
+ *        cudf::detail::atomic_add(&shmem_buffer[target_idx], source_value).
+ *      Result: thread-block partial SUM in shared memory per unique key.
+ *
+ *   3. block.sync()  ← ensures all partial results are visible across the block.
+ *
+ *   4. compute_final_aggregations()  → Phase 2 of reduction:
+ *      Each thread reads block-local partial result from shared memory.
+ *      target_idx = global_mapping_indices[block*THRESHOLD + local_rank].
+ *      Calls gmem_element_aggregator → update_target_element<T, SUM> →
+ *        cudf::detail::atomic_add(&output_col.element<Target>(target_idx), partial_sum).
+ *      Result: final per-group SUM accumulated in the RMM-backed output column.
+ *
+ * CCCL dependencies:
+ *   - cooperative_groups::this_thread_block() for block.sync()
+ *   - dispatch_type_and_aggregation → template-switches on type × aggregation kind
+ */
 CUDF_KERNEL void single_pass_shmem_aggs_kernel(cudf::size_type num_rows,
                                                bitmask_type const* row_bitmask,
                                                cudf::size_type* local_mapping_index,

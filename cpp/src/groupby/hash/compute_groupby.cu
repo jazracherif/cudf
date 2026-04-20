@@ -54,6 +54,20 @@ std::unique_ptr<table> compute_groupby(table_view const& keys,
 {
   auto const num_keys = keys.num_rows();
 
+  // CALL-GRAPH NOTE: This function is the main orchestrator for hash groupby.
+  // Steps:
+  //  1. Optionally pre-compute row hashes via thrust::tabulate (only if total nested key column
+  //     count > HASH_CACHING_THRESHOLD=4). For a single non-nested key column (e.g. `label`
+  //     utf8) this branch is skipped and `cached_hashes` is an empty zero-size device_uvector.
+  //     Result stored in `cached_hashes` (rmm::device_uvector, RMM-allocated).
+  //  2. Construct the central cuco::static_set (cuCollections/CCCL).
+  //     - Stores unique row *indices* as keys (not actual row data).
+  //     - Backed by rmm::mr::polymorphic_allocator<char> → routes to caller's RMM resource.
+  //     - Uses row_hasher_with_cache_t + linear_probing, row_comparator_t for equality.
+  //  3. Call compute_single_pass_aggs() → runs KERNEL 1 + KERNEL 2 (or global memory fallback).
+  //  4. For compound aggs (MEAN, STD etc.) run hash_compound_agg_finalizer (Thrust transforms).
+  //  5. [KERNEL 3] cudf::detail::gather() to compact unique-key row indices into output table.
+
   [[maybe_unused]] auto const [row_bitmask_data, row_bitmask] =
     [&]() -> std::pair<rmm::device_buffer, bitmask_type const*> {
     if (!skip_rows_with_nulls) { return {rmm::device_buffer{0, stream}, nullptr}; }
@@ -99,6 +113,15 @@ std::unique_ptr<table> compute_groupby(table_view const& keys,
     return hashes;
   }();
 
+  // CENTRAL DATA STRUCTURE: cuco::static_set (cuCollections, part of CCCL)
+  // - Key type: size_type (row index into the keys table, NOT the actual key values).
+  // - Capacity: num_keys * (1 / CUCO_DESIRED_LOAD_FACTOR) = 2× num_keys slots allocated.
+  // - Empty sentinel: CUDF_SIZE_TYPE_SENTINEL (INT32_MAX) marks unused slots.
+  // - Equality: d_row_equal → compares actual row data via column_device_view.
+  // - Probing: linear_probing<1, row_hasher_with_cache_t> → uses cached hashes when available.
+  // - Memory: rmm::mr::polymorphic_allocator<char> routes to the caller-supplied RMM resource
+  //           (typically a pool/arena allocator for GPU memory).
+  // - Thread scope: thread_scope_device (all GPU threads share the same set).
   auto set =
     cuco::static_set{cuco::extent<int64_t>{static_cast<int64_t>(num_keys)},
                      cudf::detail::CUCO_DESIRED_LOAD_FACTOR,  // 50% load factor
