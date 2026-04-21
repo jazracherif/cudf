@@ -121,6 +121,7 @@ std::pair<rmm::device_uvector<size_type>, bool> compute_single_pass_aggs(
     needs_global_memory_fallback.data(), 0, sizeof(cuda::std::atomic_flag), stream.value()));
 
   auto set_ref_insert = global_set.ref(cuco::op::insert_and_find);
+  // CALL-GRAPH NOTE[KERNEL 1]
   compute_mapping_indices(grid_size,
                           num_rows,
                           set_ref_insert,
@@ -143,14 +144,19 @@ std::pair<rmm::device_uvector<size_type>, bool> compute_single_pass_aggs(
     stream.synchronize();
     return h_needs_fallback.test(cuda::std::memory_order_relaxed);
   }();
+  // CALL-GRAPH NOTE: fallback, !!Performance Cliff. first just to wait for the flag, and second as a potential fallback to a worse kernel
   if (needs_fallback) { return run_aggs_by_global_mem_kernel(); }
 
+  // CALL-GRAPH NOTE: this will launch a 
   auto unique_keys = extract_populated_keys(global_set, num_rows, stream, mr);
 
   // Now, update the target indices for computing aggregations using the shared memory kernel.
   {
+    // CALL-GRAPH NOTE: create the map for each unique key hash location to its position in the K size output rank
     auto key_transform_map = compute_key_transform_map(
       num_rows, unique_keys, stream, cudf::get_current_device_resource_ref());
+
+    // CALL-GRAPH NOTE: `global_mapping_indices` is overwritten to now contain the actual output location to write the aggregates in 
     thrust::for_each_n(
       rmm::exec_policy_nosync(stream),
       thrust::make_counting_iterator(0),
@@ -167,10 +173,13 @@ std::pair<rmm::device_uvector<size_type>, bool> compute_single_pass_aggs(
       });
   }
 
+
   auto const d_spass_values = table_device_view::create(values, stream);
   auto agg_results          = create_results_table(
     static_cast<size_type>(unique_keys.size()), values, agg_kinds, is_agg_intermediate, stream, mr);
   auto d_results_ptr = mutable_table_device_view::create(*agg_results, stream);
+
+  // CALL-GRAPH NOTE[KERNEL 2] is called inside
   compute_shared_memory_aggs(grid_size,
                              available_shmem_size,
                              num_rows,
