@@ -267,6 +267,7 @@ CUDF_KERNEL void single_pass_shmem_aggs_kernel(cudf::size_type num_rows,
                                   d_agg_kinds);
     block.sync();
 
+    // Phase 1
     compute_pre_aggregations(col_start,
                              col_end,
                              row_bitmask,
@@ -280,6 +281,7 @@ CUDF_KERNEL void single_pass_shmem_aggs_kernel(cudf::size_type num_rows,
                              agg_location_offset);
     block.sync();
 
+    // Phase 2
     compute_final_aggregations(block,
                                col_start,
                                col_end,

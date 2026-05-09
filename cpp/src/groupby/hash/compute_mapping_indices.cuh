@@ -130,6 +130,13 @@ CUDF_KERNEL void mapping_indices_kernel(size_type num_input_rows,
   // Shared set initialization
   __shared__ size_type slots[valid_extent.value()];
 
+  // DESIGN NOTE: two-step construction of shared_set
+  // cuco::static_set_ref is a policy-based type: the operations it exposes (.insert(),
+  // .insert_and_find(), etc.) are compile-time template parameters, not runtime choices.
+  // Constructing raw_set with no operators first, then calling rebind_operators(), produces
+  // a new ref object (shared_set) of a different type — same backing storage (slots[]),
+  // same hash function, same key equality — but with insert_and_find compiled in.
+  // This avoids generating unused device code for operations this kernel does not need.
   auto raw_set = cuco::static_set_ref{
     cuco::empty_key<size_type>{cudf::detail::CUDF_SIZE_TYPE_SENTINEL},
     global_set.key_eq(),
