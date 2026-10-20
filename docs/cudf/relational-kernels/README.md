@@ -6,25 +6,164 @@ that revision; dispatch rules and dependency implementations can change.
 The scope is the principal algorithm families, not every dtype or aggregation
 specialization.
 
-## 1. Repository map
+## Table of contents
+
+- [1. Reading the C++ and CUDA implementation](#1-reading-the-c-and-cuda-implementation)
+- [2. Repository map](#2-repository-map)
+- [3. Optimization lens: PMPP Chapter 6](#3-optimization-lens-pmpp-chapter-6)
+- [4. API-to-kernel index](#4-api-to-kernel-index)
+- [5. Group by](#5-group-by)
+- [6. Joins](#6-joins)
+- [7. Scan / prefix operations](#7-scan--prefix-operations)
+- [8. Filters / stream compaction](#8-filters--stream-compaction)
+- [9. Reductions](#9-reductions)
+- [10. Sorting](#10-sorting)
+- [11. Research papers and study references](#11-research-papers-and-study-references)
+- [12. Studying the library-owned kernels](#12-studying-the-library-owned-kernels)
+
+## 1. Reading the C++ and CUDA implementation
+
+Start with the [libcudf developer guide][developer-guide-web] for conventions and
+the [API reference][api-reference] for overloads, supported types, null semantics,
+exceptions, and ownership contracts. Those sites describe the latest release;
+the source links in this guide describe the pinned revision above. The website
+could not be fetched during this update, so the conventions below were verified
+against the repository's [developer-guide source][developer-guide-source], rather
+than attributed to unverified website content.
+
+### Execution spaces and source conventions
+
+- `.hpp`/`.cpp` contain C++ declarations/definitions; `.cuh`/`.cu` are used when
+  CUDA device code or device execution policies are needed. A `.cu` file can
+  contain host orchestration as well as kernels.
+- A public API usually validates arguments, selects an internal implementation,
+  allocates output, and enqueues work. `__global__` identifies a launchable kernel;
+  `__device__` identifies a GPU function called from device code. Under CUDA,
+  [`CUDF_KERNEL` expands to `__global__ static`][kernel-macro].
+- `CUDF_HOST_DEVICE` allows a function in both execution spaces. `constexpr`
+  alone does not make a host function callable on the GPU. The developer guide
+  requires device-compatible annotations and recommends `cuda::std` utilities
+  in device code rather than assuming ordinary `std` functions are device-callable.
+- Expect `snake_case`, an underscore prefix on private members, and "east const":
+  `column_view const&` means a reference to a const view. It does not transfer
+  ownership or make the underlying allocation independently owned.
+- The guide prefers STL/Thrust algorithms and owning structures/views over raw
+  loops and allocations. A short wrapper around a library primitive can therefore
+  represent substantial GPU execution; follow its device functor as well as the call.
+
+### Runtime-to-compile-time dispatch
+
+A column's `data_type` is known at runtime, while typed element loads and operators
+need concrete C++ types at compilation. [`type_dispatcher`][type-dispatch] bridges
+the two: its switch selects a precompiled instantiation of a functor's templated
+`operator()`. It does not compile a new kernel when each column arrives.
+`dispatch_storage_type` can select an underlying representation, such as an
+integer representation for a decimal, rather than its logical wrapper type.
+
+When reading `f.template operator()<T>(...)`, `template` disambiguates a dependent
+member template for the parser. Likewise, `typename Derived::op` declares that
+the dependent name denotes a type. These keywords are C++ parsing rules, not
+additional runtime work. Dispatch branches must agree on a compatible return
+type; owning results can remain type-erased as `unique_ptr<column>` or
+`unique_ptr<scalar>` even though computation is typed internally.
+
+### Template parameters, constraints, and compile-time branches
+
+**Type parameters** select element, iterator, operator, or comparator types.
+**Non-type template parameters** select values such as aggregation kind,
+block size, nullability, or stable/unstable sorting. They create distinct
+instantiations, enabling specialization and removing unnecessary choices from
+device execution, at the cost of compilation time and potentially code size.
+
+[`requires` and type traits][reduce-dispatch] constrain which template overloads
+participate for a type/operator pair. Older paths also use `std::enable_if_t`
+(SFINAE): substitution can remove an inapplicable overload without making the
+whole program ill-formed. A catch-all may still be selected to report an
+unsupported runtime request.
+
+[`if constexpr` in sorting][table-sort] selects a compile-time branch; the
+discarded branch is not instantiated for that specialization. An ordinary `if`
+tests a runtime value and generally requires both branches to be valid.
+Neither templates nor compile-time selection prove that data-dependent branches
+inside the selected algorithm disappear.
+
+### Device function objects and iterator composition
+
+A **functor** is an object with `operator()`. It packages behavior and state:
+for example, [`boolean_mask_filter`][filter-entry] holds a column device view,
+and its `__device__ operator()` tests one row. A lambda is another callable object;
+the `__device__` annotation makes its body usable on the GPU. CUB/Thrust can
+instantiate kernels with such callables, allowing cuDF's type/null semantics
+to be inlined without a virtual call for each element.
+
+Iterators describe how to obtain values, not necessarily stored arrays.
+A counting iterator generates row indices, a transform iterator computes a value
+on dereference, and a zip iterator presents several inputs as tuples.
+Output-transform iterators adapt writes. In the [reduction driver][simple-reduce],
+this composes loading, casting, and null replacement without allocating a
+complete transformed column. The transformation can be reevaluated on accesses;
+an iterator does not imply cached data, register tiling, or a particular kernel.
+
+### Inheritance: static reuse versus runtime polymorphism
+
+The **Curiously Recurring Template Pattern (CRTP)** passes the derived class to
+its base: [`sum : simple_op<sum>`][stats]. The base retrieves types and operations
+from `Derived`, sharing the operator interface without virtual dispatch.
+`compound_op<Derived>` adds intermediate-result finalization for mean/variance/std.
+Read a CRTP base together with the derived operator's aliases and methods.
+
+Ordinary inheritance also provides simple implementation reuse:
+[`null_replaced_value_accessor : value_accessor<SourceType>`][groupby-reduce]
+adds validity handling to typed value access. Inheritance does not necessarily
+mean virtual dispatch; check whether a virtual function is actually involved.
+
+By contrast, the [host aggregation descriptor hierarchy][aggregation-types]
+uses virtual interfaces and virtual inheritance to represent user-requested
+operations across supported API families. The host inspects kind/parameters and
+dispatches to typed computation. Do not confuse this descriptor hierarchy with
+per-element virtual calls in the GPU hot path.
+
+### Ownership, PImpl, streams, and memory resources
+
+RAII ties resource lifetime to an owning C++ object. Columns, RMM buffers, and
+`unique_ptr` acquire/release resources; a `unique_ptr` also makes exclusive
+ownership transfer explicit. A view is non-owning and zero-copy: its underlying
+data must outlive the work that reads it. A device view additionally provides
+GPU-accessible metadata and typed element access; it does not copy an entire
+column's values into the kernel.
+
+The hash join uses **PImpl** ("pointer to implementation") to hide its hash-table
+representation behind an implementation object. The reusable object retains
+preprocessing/build state, while its viewed build data must remain valid.
+`unique_ptr<impl>` controls the implementation object's lifetime, not ownership
+of every buffer referenced by a view.
+
+`rmm::cuda_stream_view` identifies the stream on which work is ordered; it is not
+an owning stream handle. `rmm::device_async_resource_ref` identifies an allocation
+resource. A host function returning does not generally mean its device work has
+finished: preserve input/output and preprocessing lifetimes and respect stream
+ordering. `rmm::exec_policy_nosync(stream)` connects Thrust work to that stream;
+it does not mean every operation can avoid synchronization or host-visible sizing.
+
+## 2. Repository map
 
 The repository root for this analysis is `/home/runner/work/cudf/cudf`.
 Paths in the table are absolute local paths; the source links below are portable
 GitHub permalinks.
 
-| Location | Responsibility |
-| --- | --- |
-| `/home/runner/work/cudf/cudf/python/cudf` | Python DataFrame and Series API |
-| `/home/runner/work/cudf/cudf/python/pylibcudf` | Python bindings to libcudf |
-| `/home/runner/work/cudf/cudf/cpp/include/cudf` | Public C++ APIs and device-facing types |
-| `/home/runner/work/cudf/cudf/cpp/include/cudf/detail` | Internal APIs, CUDA templates, row operators, and gather |
-| `/home/runner/work/cudf/cudf/cpp/src/groupby` | Hash and sort group by |
-| `/home/runner/work/cudf/cudf/cpp/src/join` | Hash, sort-merge, conditional, mixed, and specialized joins |
-| `/home/runner/work/cudf/cudf/cpp/src/reductions` | Scalar/segmented reduction and prefix scan |
-| `/home/runner/work/cudf/cudf/cpp/src/stream_compaction` | Boolean filtering, null filtering, distinct, and unique |
-| `/home/runner/work/cudf/cudf/cpp/src/sort` | Sorting permutations, radix/comparator sorting, segmented sorting |
-| `/home/runner/work/cudf/cudf/cpp/tests` | C++ correctness tests |
-| `/home/runner/work/cudf/cudf/cpp/benchmarks` | Performance benchmarks |
+| Name | Location | Responsibility |
+| --- | --- | --- |
+| `cudf` | `/home/runner/work/cudf/cudf/python/cudf` | Python DataFrame and Series API |
+| `pylibcudf` | `/home/runner/work/cudf/cudf/python/pylibcudf` | Python bindings to libcudf |
+| Public headers | `/home/runner/work/cudf/cudf/cpp/include/cudf` | Public C++ APIs and device-facing types |
+| Internal headers | `/home/runner/work/cudf/cudf/cpp/include/cudf/detail` | Internal APIs, CUDA templates, row operators, and gather |
+| `groupby` | `/home/runner/work/cudf/cudf/cpp/src/groupby` | Hash and sort group by |
+| `join` | `/home/runner/work/cudf/cudf/cpp/src/join` | Hash, sort-merge, conditional, mixed, and specialized joins |
+| `reductions` | `/home/runner/work/cudf/cudf/cpp/src/reductions` | Scalar/segmented reduction and prefix scan |
+| `stream_compaction` | `/home/runner/work/cudf/cudf/cpp/src/stream_compaction` | Boolean filtering, null filtering, distinct, and unique |
+| `sort` | `/home/runner/work/cudf/cudf/cpp/src/sort` | Sorting permutations, radix/comparator sorting, segmented sorting |
+| Tests | `/home/runner/work/cudf/cudf/cpp/tests` | C++ correctness tests |
+| Benchmarks | `/home/runner/work/cudf/cudf/cpp/benchmarks` | Performance benchmarks |
 
 ### Reading a call chain
 
@@ -41,7 +180,7 @@ cuDF kernel. In those cases, the cuDF device predicate, comparator, or operator
 is the right entry point for understanding relational semantics.
 RMM supplies memory allocation and stream integration, not the relational algorithm.
 
-## 2. Optimization lens: PMPP Chapter 6
+## 3. Optimization lens: PMPP Chapter 6
 
 The requested lens is *Programming Massively Parallel Processors*, fifth edition,
 Chapter 6, Figure 6.13, "A checklist of optimizations."
@@ -86,32 +225,32 @@ than assuming that every CUB/Thrust/cuCollections specialization implements them
 Optimizations not evidenced below remain unestablished for the cited paths;
 that does not mean they are absent from the compiler output or dependencies.
 
-## 3. API-to-kernel index
+## 4. API-to-kernel index
 
 Signatures below list the identifying parameters and omit defaults.
 `stream` means `rmm::cuda_stream_view`; `mr` means
 `rmm::device_async_resource_ref`. Follow the linked declarations/definitions for
 complete types and overloads.
 
-| API | Execution entry and device work |
-| --- | --- |
-| `groupby::aggregate(host_span<aggregation_request const>, stream, mr)` | [Dispatch][groupby-entry] -> hash mapping/atomic aggregation or sort/segmented reduction |
-| `groupby::scan(host_span<scan_request const>, stream, mr)` | [Entry][groupby-entry] -> sort-based grouped scan |
-| `inner_join/left_join/full_join(table_view const&, table_view const&, null_equality, stream, mr)` | [Wrappers][join-entry] -> reusable hash join -> cuCollections insertion/retrieval |
-| `hash_join::inner_join/left_join/full_join(probe, optional<size_t> output_size, stream, mr)` | [Object methods][hash-build] -> [probe/retrieve][hash-retrieve] |
-| `sort_merge_join::inner_join/left_join(left, sorted, stream, mr)` | [Declarations][smj-api] -> bounds searches, scans, range expansion |
-| `conditional_*_join(left, right, ast::expression const&, ...)` | [Wrappers][conditional-api] -> explicit nested-loop kernels |
-| `scan(column_view const&, scan_aggregation const&, scan_type, null_policy, stream, mr)` | [Entry][scan-entry] -> Thrust inclusive/exclusive scan |
-| `apply_boolean_mask(table_view const&, column_view const&, stream, mr)` | [Entry/predicate][filter-entry] -> `copy_if` -> gather |
-| `reduce(column_view const&, reduce_aggregation const&, data_type, [init,] stream, mr)` | [Declarations][reduction-api] -> typed operator -> CUB reduction |
-| `segmented_reduce(values, offsets, agg, output_type, null_policy, [init,] stream, mr)` | [Declarations][reduction-api] -> CUB segmented reduction for corresponding paths |
-| `sorted_order/sort(input, column_order, null_precedence, stream, mr)` | [Entry][sort-entry] -> radix sort or comparator sort |
-| `sort_by_key(values, keys, column_order, null_precedence, stream, mr)` | [Entry][sort-entry] -> sorted permutation -> gather |
+| Function name | Identifying parameters | Execution entry and device work |
+| --- | --- | --- |
+| `groupby::aggregate` | `(host_span<aggregation_request const>, stream, mr)` | [Dispatch][groupby-entry] -> hash mapping/atomic aggregation or sort/segmented reduction |
+| `groupby::scan` | `(host_span<scan_request const>, stream, mr)` | [Entry][groupby-entry] -> sort-based grouped scan |
+| `inner_join`, `left_join`, `full_join` | `(table_view const&, table_view const&, null_equality, stream, mr)` | [Wrappers][join-entry] -> reusable hash join -> cuCollections insertion/retrieval |
+| `hash_join::inner_join`, `hash_join::left_join`, `hash_join::full_join` | `(probe, optional<size_t> output_size, stream, mr)` | [Object methods][hash-build] -> [probe/retrieve][hash-retrieve] |
+| `sort_merge_join::inner_join`, `sort_merge_join::left_join` | `(left, sorted, stream, mr)` | [Declarations][smj-api] -> bounds searches, scans, range expansion |
+| `conditional_*_join` | `(left, right, ast::expression const&, ...)` | [Wrappers][conditional-api] -> explicit nested-loop kernels |
+| `scan` | `(column_view const&, scan_aggregation const&, scan_type, null_policy, stream, mr)` | [Entry][scan-entry] -> Thrust inclusive/exclusive scan |
+| `apply_boolean_mask` | `(table_view const&, column_view const&, stream, mr)` | [Entry/predicate][filter-entry] -> `copy_if` -> gather |
+| `reduce` | `(column_view const&, reduce_aggregation const&, data_type, [init,] stream, mr)` | [Declarations][reduction-api] -> typed operator -> CUB reduction |
+| `segmented_reduce` | `(values, offsets, agg, output_type, null_policy, [init,] stream, mr)` | [Declarations][reduction-api] -> CUB segmented reduction for corresponding paths |
+| `sorted_order`, `sort` | `(input, column_order, null_precedence, stream, mr)` | [Entry][sort-entry] -> radix sort or comparator sort |
+| `sort_by_key` | `(values, keys, column_order, null_precedence, stream, mr)` | [Entry][sort-entry] -> sorted permutation -> gather |
 
 Joins generally return row-index vectors rather than a materialized joined table.
 Likewise, `sorted_order` produces a permutation, whereas `sort` materializes values.
 
-## 4. Group by
+## 5. Group by
 
 ### Hash aggregation
 
@@ -195,7 +334,7 @@ gathers, nested-key comparisons, or highly unequal segment sizes dominant?
 **Study:** [Blelloch][blelloch] for scan/segmentation foundations. This is background,
 not a claim that the hash group by implements a named paper.
 
-## 5. Joins
+## 6. Joins
 
 ### General hash equijoins
 
@@ -351,7 +490,7 @@ than using the conditional join's warp output cache, so that cache's
 Processors][join-paper]. It is historical/algorithmic background, not a specification
 of the current cuCollections hash table or this sort-merge implementation.
 
-## 6. Scan / prefix operations
+## 7. Scan / prefix operations
 
 Here "scan" means a prefix computation, not reading a database table.
 The [API dispatcher][scan-entry] selects inclusive/exclusive and special rank paths.
@@ -392,7 +531,7 @@ parallel results need not be bitwise equal to sequential accumulation.
 scan techniques, but the cuDF call alone does not establish the exact Thrust
 backend selected for every type and dependency version.
 
-## 7. Filters / stream compaction
+## 8. Filters / stream compaction
 
 **Algorithm.** [`apply_boolean_mask`][filter-entry] selects rows whose mask is
 true and valid, compacts row indices with `thrust::copy_if`, and gathers all
@@ -429,7 +568,7 @@ or nested children dominates.
 predicate -> prefix positions -> scatter approach to stream compaction.
 This is not a claim about the exact current Thrust `copy_if` implementation.
 
-## 8. Reductions
+## 9. Reductions
 
 ### Simple and segmented reductions
 
@@ -491,7 +630,7 @@ Variance: Analysis and Recommendations][variance-paper], explicitly cited in
 the implementation. [GPU Gems][gpu-gems] also introduces tree-style parallel
 combination, although its primary subject is scan.
 
-## 9. Sorting
+## 10. Sorting
 
 ### Radix fast path
 
@@ -571,27 +710,26 @@ sorting; this path should not be described simply as segmented radix sort.
 Algorithms for Manycore GPUs][sort-paper]. It explains GPU radix/merge design
 principles, not necessarily the precise current CUB implementation.
 
-## 10. C++ concepts in the CUDA implementation
+## 11. Research papers and study references
 
-| Mechanism | Concrete example and purpose |
-| --- | --- |
-| Runtime-to-compile-time dispatch | [`type_dispatcher`][type-dispatch] maps a runtime column dtype to a typed functor invocation |
-| Non-type template parameters | Aggregation kind, block size, nullability, and sorting method specialize generated code |
-| Constraints and traits | [`requires`-constrained reductions][reduce-dispatch] admit supported type/operator combinations |
-| `if constexpr` | Selects stable sort and removes unneeded branches/instantiations |
-| Device function objects | Predicates, hashers, comparators, and aggregation operators plug cuDF semantics into generic kernels |
-| Iterator composition | Counting/transform/zip iterators fuse element access with computation rather than allocating every intermediate |
-| CRTP inheritance | [`sum : simple_op<sum>` and `variance : compound_op<variance>`][stats] reuse interfaces statically |
-| Ordinary inheritance | [`null_replaced_value_accessor : value_accessor<SourceType>`][groupby-reduce] extends typed access |
-| Runtime polymorphism | The [host aggregation descriptor hierarchy][aggregation-types] represents requested operations |
-| PImpl and RAII | Hash-join implementation objects, owning columns, `unique_ptr`, and RMM buffers manage implementation boundaries and lifetimes |
+This reading list consolidates every research/study reference cited above.
+An explicit source citation is stronger evidence than an algorithmic resemblance:
+background papers do not establish the exact dependency kernel used by this revision.
 
-Host-side virtual aggregation descriptors should not be confused with the GPU
-hot path: device execution largely uses statically selected functors/templates.
-Views do not own underlying data; source buffers and comparator preprocessing
-must remain alive for the asynchronous device work using them.
+| Reference | Main contribution / what to study | Relevant cuDF areas | Evidence relationship |
+| --- | --- | --- | --- |
+| Blelloch, [Prefix Sums and Their Applications][blelloch] | Treat scan as a reusable parallel primitive; express recurrences and segmented computations through associative composition. Start here for the EWMA pair operator. | Scan, EWMA, grouped scan, compaction foundations | EWMA explicitly cites Blelloch's 1990 technical report; the linked 1993 chapter is a later presentation of this material. Grouping/compaction connections are background. |
+| Merrill and Garland, [Single-pass Parallel Prefix Scan with Decoupled Look-back][lookback] (2016) | Coordinate prefix propagation across thread blocks while reducing redundant data movement; study the distinction between local tile work and global prefix resolution. | Device-wide scan and scans inside other pipelines | Background for modern scan backends; the Thrust API call alone does not identify this exact implementation. |
+| He et al., [Relational Joins on Graphics Processors][join-paper] (SIGMOD 2008) | GPU implementations of relational join families and their memory/work-distribution tradeoffs. Compare hash, sort-merge, and nested-loop designs. | Hash, sort-merge, conditional/mixed joins | Historical background, not evidence for today's double-hashing multiset or the current bounds-search matching phase. |
+| Chan, Golub, and LeVeque, [Algorithms for Computing the Sample Variance: Analysis and Recommendations][variance-paper] (1983) | Merge partial sums and squared deviations robustly rather than subtracting nearly equal squared quantities. Study the pairwise combination equations. | Variance and standard-deviation reductions | Explicitly cited by `var_std`; its `operator+` implements the pairwise combination. |
+| Satish, Harris, and Garland, [Designing Efficient Sorting Algorithms for Manycore GPUs][sort-paper] (2009) | Design radix/merge sorting around GPU parallelism and memory traffic. Study the tradeoff between fixed-width key processing and comparison-based ordering. | Radix and comparator sorting | Background, not a claim that current CUB/Thrust reproduces every kernel from the paper. |
+| Harris, Sengupta, and Owens, [GPU Gems 3, Chapter 39: Parallel Prefix Sum (Scan) with CUDA][gpu-gems] (2007) | Introductory scan construction, work efficiency, shared-memory considerations, and scan-based applications such as compaction. | Scan, filtering/compaction, parallel combination foundations | Tutorial/book chapter rather than a research paper; useful foundations, not a description of the current library backends. |
 
-## 11. Studying the library-owned kernels
+The PMPP Figure 6.13 checklist in Section 3 is an optimization taxonomy from a
+textbook, not an additional research paper. Use it to ask source/profiling questions
+across these algorithms, rather than as proof of any particular implementation.
+
+## 12. Studying the library-owned kernels
 
 For the actual dependency-level `__global__` bodies, continue into:
 
@@ -655,7 +793,7 @@ is needed to establish bottlenecks and tradeoffs.
 [table-sort]: https://github.com/jazracherif/cudf/blob/e81ad54ed957866c235cf0720fc3ef8986aa39b0/cpp/src/sort/sort_impl.cuh#L31-L95
 [row-compare]: https://github.com/jazracherif/cudf/blob/e81ad54ed957866c235cf0720fc3ef8986aa39b0/cpp/include/cudf/detail/row_operator/lexicographic.cuh#L158-L605
 [segmented-sort]: https://github.com/jazracherif/cudf/blob/e81ad54ed957866c235cf0720fc3ef8986aa39b0/cpp/src/sort/segmented_sort_impl.cuh
-[type-dispatch]: https://github.com/jazracherif/cudf/blob/e81ad54ed957866c235cf0720fc3ef8986aa39b0/cpp/include/cudf/utilities/type_dispatcher.hpp#L353-L465
+[type-dispatch]: https://github.com/jazracherif/cudf/blob/e81ad54ed957866c235cf0720fc3ef8986aa39b0/cpp/include/cudf/utilities/type_dispatcher.hpp#L353-L490
 [aggregation-types]: https://github.com/jazracherif/cudf/blob/e81ad54ed957866c235cf0720fc3ef8986aa39b0/cpp/include/cudf/aggregation.hpp#L67-L203
 [blelloch]: https://www.cs.cmu.edu/~guyb/papers/Ble93.pdf
 [lookback]: https://research.nvidia.com/sites/default/files/pubs/2016-03_Single-pass-Parallel-Prefix/nvr-2016-002.pdf
@@ -665,3 +803,6 @@ is needed to establish bottlenecks and tradeoffs.
 [sort-paper]: https://mgarland.org/files/papers/gpusort-ipdps09.pdf
 [checklist-comment]: https://github.com/jazracherif/cudf/pull/1#discussion_r4331173782
 [checklist-image]: https://github.com/user-attachments/assets/f6c559f0-2b28-4a06-babc-60b9a06367a1
+[developer-guide-web]: https://docs.nvidia.com/cudf/latest/libcudf/developer_guide/DEVELOPER_GUIDE/
+[api-reference]: https://docs.nvidia.com/cudf/latest/libcudf/api_docs/
+[developer-guide-source]: https://github.com/jazracherif/cudf/blob/e81ad54ed957866c235cf0720fc3ef8986aa39b0/cpp/doxygen/developer_guide/DEVELOPER_GUIDE.md
