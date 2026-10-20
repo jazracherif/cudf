@@ -478,6 +478,6 @@ is needed to establish bottlenecks and tradeoffs.
 [blelloch]: https://www.cs.cmu.edu/~guyb/papers/Ble93.pdf
 [lookback]: https://research.nvidia.com/sites/default/files/pubs/2016-03_Single-pass-Parallel-Prefix/nvr-2016-002.pdf
 [gpu-gems]: https://developer.nvidia.com/gpugems/gpugems3/part-vi-gpu-computing/chapter-39-parallel-prefix-sum-scan-cuda
-[join-paper]: https://www.microsoft.com/en-us/research/publication/relational-joins-on-graphics-processors/
+[join-paper]: https://doi.org/10.1145/1376616.1376670
 [variance-paper]: https://doi.org/10.1080/00031305.1983.10483115
 [sort-paper]: https://mgarland.org/files/papers/gpusort-ipdps09.pdf
