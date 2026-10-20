@@ -45,21 +45,46 @@ RMM supplies memory allocation and stream integration, not the relational algori
 
 The requested lens is *Programming Massively Parallel Processors*, fifth edition,
 Chapter 6, Figure 6.13, "A checklist of optimizations."
-The exact figure was not supplied or verified for this analysis. The following
-categories are an original, PMPP-inspired working framework, **not a transcription
-or an exact mapping to that figure**:
+The table below reproduces the checklist supplied in the
+[PR comment][checklist-comment] and [image][checklist-image]. Its benefits describe
+the optimization rationale, not measurements or guarantees for cuDF.
 
-1. **Work assignment:** enough parallelism, grid-stride traversal, load balance.
-2. **Memory access:** coalescing, bandwidth, irregular gathers, temporary traffic.
-3. **Reuse:** registers, shared-memory staging, tiling, and avoiding repeated work.
-4. **Control flow:** divergence, specialization, and unnecessary instructions.
-5. **Coordination:** synchronization, atomic contention, and privatization.
-6. **Resources:** registers/shared memory, occupancy, and launch overhead.
+### FIGURE 6.13: A checklist of optimizations
+
+| Category | Optimization | Benefit to Compute Cores | Benefit to Memory | Strategies |
+| :--- | :--- | :--- | :--- | :--- |
+| **Compute utilization** | Occupancy tuning | More work to hide pipeline latency | More parallel memory accesses to hide DRAM latency | Tune the usage of SM resources such as threads per block, shared memory per block, and registers per thread |
+| | Loop unrolling | Fewer branch instructions and more independent instruction sequences with fewer stalls | May enable promoting local arrays to registers to reduce global memory traffic | <ul><li>Performed automatically by the compiler</li><li>Use loops with constant bounds where possible to facilitate the compiler's job</li></ul> |
+| | Reducing control divergence | High SIMD efficiency (fewer idle cores during SIMD execution) | - | <ul><li>Rearrange the assignment of threads to work and/or data</li><li>Rearranging the layout of the data</li></ul> |
+| **Memory utilization** | Using coalesceable global memory accesses | Fewer pipeline stalls waiting for global memory accesses | Less global memory traffic and better utilization of bursts/cache-lines | <ul><li>Rearranging the mapping of threads to data</li><li>Rearranging the layout of the data (e.g., matrix transposition, converting an array-of-structures to a structure-of-arrays)</li><li>Transfer data between global memory and shared memory in a coalesceable manner and perform irregular accesses in shared memory (e.g., corner turning, packing)</li></ul> |
+| | Shared memory tiling | Fewer pipeline stalls waiting for global memory accesses | Less global memory traffic | Place data that is reused within a block in shared memory so that it is transferred between global memory and the SM only once |
+| | Register tiling | Fewer pipeline stalls waiting for shared memory accesses | Less shared memory traffic | Place data that is reused within a warp or thread in registers so that it is transferred between shared memory and registers only once |
+| | Vector loads and stores | Fewer instructions executed to manage memory accesses | More parallel memory accesses to hide DRAM latency | Assign each thread to load 16 B chunks of contiguous data |
+| | Avoiding shared memory bank conflicts | Fewer pipeline stalls waiting for shared memory accesses | Less shared memory traffic and better utilization of shared memory banks | <ul><li>Rearranging the mapping of threads to data</li><li>Rearranging the layout of the data (e.g., padding)</li></ul> |
+| | Privatization (covered later) | Fewer pipeline stalls waiting for atomic updates | Less contention and serialization of atomic updates | Apply partial updates to a private copy of the data then update the public copy when done |
+| **Synchronization latency** | Warp-level primitives | Reduce block-wide barrier synchronizations | Less global and shared memory traffic | Perform operations requiring barrier synchronization at the warp-level, then consolidate warp-level results at the block-level |
+| | Double buffering | Eliminates barriers that enforce false dependences | - | Eliminate false (write-after-read) dependences by using different buffers for the writes and the preceding reads |
+| **General** | Thread coarsening | Depends on the overhead of parallelization | Depends on the overhead of parallelization | Assign multiple units of parallelism to each thread in order to reduce the overhead of parallelization when it is incurred unnecessarily |
 
 Each operation below separates **source observations** from **profiling questions**.
 No speedup, occupancy level, bandwidth, or bottleneck is claimed to have been
 measured. In particular, shared memory does not automatically mean faster execution,
 and maximizing occupancy is not itself the objective.
+
+**How to read the mappings.** A shared allocation is not by itself evidence of
+**Shared memory tiling**; scalar locals do not establish **Register tiling**.
+Two input/output buffers do not establish the false-dependence-removal pattern
+of **Double buffering**. Adjacent scalar accesses across lanes are not
+**Vector loads and stores**, which concerns each thread's memory instructions.
+Likewise, alignment alone does not establish **Avoiding shared memory bank
+conflicts**. Confirm generated instructions and access patterns where needed.
+Grid-stride loops assign multiple items per thread when inputs exceed the grid,
+but do not by themselves prove that a tuned **Thread coarsening** factor was used.
+
+For library-owned kernels, the mappings identify relevant checklist items rather
+than assuming that every CUB/Thrust/cuCollections specialization implements them.
+Optimizations not evidenced below remain unestablished for the cited paths;
+that does not mean they are absent from the compiler output or dependencies.
 
 ## 3. API-to-kernel index
 
@@ -110,16 +135,28 @@ Shared-memory eligibility also depends on aggregation/type and resource availabi
 - [`update_target_element_gmem<Source, Kind>::operator()`][atomic-aggs]:
   `__device__`, aggregation-specific atomic updates.
 
-**Optimization observations.** Shared partials reduce global update traffic.
-For low cardinality, the shared kernel replicates aggregation locations across
-threads to reduce contention before combining them. Its phases synchronize around
-shared state. The driver sizes its grid using occupancy information for both
-mapping and aggregation kernels. Group indices make output access irregular.
+**Checklist mapping (source observations).**
+
+- **Compute utilization / Occupancy tuning:** the [driver][groupby-driver] sizes
+  its grid using occupancy information for both mapping and aggregation kernels
+  and checks shared-memory compatibility.
+- **Memory utilization / Privatization:** [block-local aggregation][shared-aggs]
+  accumulates partial results before global updates. For low cardinality, it
+  replicates aggregation locations across threads to reduce contention further.
+  This is privatization, not an input-data **Shared memory tiling** claim.
+- **Memory utilization / Using coalesceable global memory accesses:** adjacent
+  threads traverse adjacent source rows in `compute_pre_aggregations`, enabling
+  coalesced reads for fixed-width column data. Group-indexed output remains irregular.
+- **General / Thread coarsening:** grid-stride mapping and aggregation reuse
+  threads for multiple rows when needed, though no tuned per-thread tile is
+  established. Shared aggregation phases still require block-wide barriers.
 
 **Profiling questions.** How do key skew, distinct-group count, and aggregation
 width affect atomics, shared-memory pressure, and fallback frequency? Compare the
 cost of mapping/materialization against aggregation itself; do not assume the
-shared path wins for every workload.
+shared path wins for every workload. For **Avoiding shared memory bank conflicts**,
+inspect actual shared-index patterns; replicated counters target atomic contention,
+not a demonstrated conflict-free bank layout.
 
 ### Sort aggregation and grouped scan
 
@@ -138,9 +175,19 @@ the device-wide kernels are library-owned.
 keys, no previously established sort helper, and fully supported requests.
 Otherwise aggregation uses sorting. `groupby::scan` uses the sort path.
 
-**Optimization observations.** Sorted groups enable contiguous segmented work,
-but obtaining the permutation and gathering values adds traffic. Device accessors
-handle null replacement without materializing a separate transformed column.
+**Checklist mapping (source observations and library boundary).**
+
+- **Memory utilization / Using coalesceable global memory accesses:** grouped
+  values and contiguous labels expose sequential ranges to segmented reduction
+  and scan. Obtaining the permutation and gathering values adds traffic, with
+  indirect source reads; grouping is not a guarantee of coalescing at every stage.
+- **Compute utilization / Reducing control divergence:** typed aggregation
+  specializations select supported operators. Data-dependent null and key
+  comparisons can still diverge; specialization is not a measured SIMD improvement.
+- **Warp-level primitives**, **Register tiling**, and **Thread coarsening** within
+  `reduce_by_key`/`inclusive_scan_by_key` require inspecting the selected library
+  kernels. Device accessors avoid a separate null-replaced column, but iterator
+  fusion is not itself proof of any tiling optimization.
 
 **Profiling questions.** How much sorting can be amortized across requests? Are
 gathers, nested-key comparisons, or highly unequal segment sizes dominant?
@@ -167,10 +214,22 @@ cuDF device entry points include `hasher1::operator()`, `hasher2::operator()`,
 and [`pair_equal::operator()` / `primitive_pair_equal::operator()`][join-compare].
 Hash equality alone is not enough to establish a match.
 
-**Optimization observations.** Building the smaller input reduces build work.
-The reusable object amortizes build preprocessing across probes. Primitive and
-nested row paths select different comparators. An optional known output size can
-avoid counting. Probe chains and variable match multiplicity imply irregular work.
+**Checklist mapping (source observations and library boundary).**
+
+- **Compute utilization / Reducing control divergence:** [dispatch][join-compare]
+  separates primitive and nested row comparison paths. This avoids a universal
+  comparator, but probe lengths and match multiplicities remain data-dependent.
+- **Memory utilization / Using coalesceable global memory accesses:** row-wise
+  hashing can read adjacent fixed-width column elements, while hash-table probing
+  and matched-row comparisons access irregular locations. Do not label the whole
+  join as coalesced.
+- **Occupancy tuning**, **Warp-level primitives**, and **Vector loads and stores**
+  in the main insertion/retrieval kernels are library-level questions, not
+  established by cuDF's `insert`/`retrieve` calls.
+
+Building the smaller input, reusing build preprocessing, and supplying a known
+output size can reduce work. These are additional algorithm/pipeline optimizations,
+not evidence of **Thread coarsening** or **Shared memory tiling**.
 
 **Profiling questions.** Examine load factor, collisions, duplicate-key skew,
 probe memory access, and output size. Many-to-many output expansion can dominate
@@ -184,9 +243,25 @@ even if hash lookup is efficient.
 `mark_probe_kernel`, `mark_retrieve_kernel`, `compact_if_kernel`, and
 `clear_marks_kernel` entry points.
 
-**Optimization observations.** Specialized existence/marking operations avoid
-materializing every matching pair. Mark storage and compaction introduce their
-own traffic and coordination.
+**Checklist mapping (source observations).**
+
+- **Synchronization latency / Warp-level primitives:** in [mark join][mark-join],
+  `cg::reduce` combines per-thread mark counts at warp level before block/global
+  updates. Retrieval/compaction use warp synchronization and broadcast reservations.
+- **Memory utilization / Privatization:** thread-local counts and a block-local
+  counter reduce global counter updates. Warp-local output buffers batch index
+  writes; global hash-slot marking still requires atomics.
+- **Memory utilization / Using coalesceable global memory accesses:** retrieval
+  packs indices into shared buffers, then lanes flush consecutive output positions.
+  This is the checklist's packing strategy, not reused-input tiling.
+- **Compute utilization / Loop unrolling:** `#pragma unroll` explicitly requests
+  unrolling the constant-bounded full-buffer flush loops in retrieval/compaction.
+- **Compute utilization / Occupancy tuning:** mark-probe launch sizing queries
+  `cudaOccupancyMaxActiveBlocksPerMultiprocessor`.
+
+These explicit observations apply to mark join, not automatically to
+`distinct_hash_join`'s library-owned find kernels. Existence-based execution
+avoids pair materialization in both families, but is not itself a tiling mechanism.
 
 **Profiling questions.** Compare hit rate, duplicates, mark contention, and the
 cost of output compaction rather than extrapolating from general join throughput.
@@ -201,9 +276,21 @@ searches for equal ranges, scan match counts into offsets, and expand ranges
 into index pairs. The [matching implementation][smj-code] is not simply a single
 linear two-pointer merge.
 
-**Optimization observations.** Presorted inputs/reused build preprocessing save
-sorting. Match-count scans assign disjoint output ranges. Bounds searches create
-irregular reads; later expansion may have very uneven output per key.
+**Checklist mapping (source observations and library boundary).**
+
+- **Memory utilization / Using coalesceable global memory accesses:** match counts
+  and scanned offsets form contiguous arrays. Binary searches and permutation-based
+  comparisons still read irregularly; disjoint output ranges alone do not prove
+  coalesced writes across lanes.
+- **Compute utilization / Reducing control divergence:** unequal search paths and
+  match-range lengths are potential divergence sources, not optimizations shown to
+  have been eliminated.
+- **Warp-level primitives**, **Register tiling**, and **Thread coarsening** in
+  bounds searches, scans, and copies must be checked in the chosen library kernels.
+
+Presorted inputs and reused build preprocessing save sorting. Scanning counts
+assigns disjoint output ranges; that does not establish **Privatization** of shared
+atomic state or **Double buffering**.
 
 **Profiling questions.** Separate sorting, searches, scans, and expansion. Check
 duplicate distribution and the cost of nested-key comparisons.
@@ -220,10 +307,25 @@ Explicit [`CUDF_KERNEL` entry points][conditional-kernels]:
 `conditional_join_anti_semi`.
 Device helpers include `add_pair_to_cache` and `flush_output_cache`.
 
-**Optimization observations.** Warp-local shared output caches batch global
-writes and counter reservations. Warp synchronization protects coordination.
-Compile-time nullability specializes expression handling. This remains quadratic
-candidate work for a general all-pairs predicate; caching does not change that.
+**Conditional checklist mapping (source observations).**
+
+- **Synchronization latency / Warp-level primitives:** `__ballot_sync`,
+  `__syncwarp`, and `cub::ShuffleIndex` coordinate active lanes and share output
+  reservations without a block-wide barrier for each cache flush.
+- **Memory utilization / Privatization:** the size pass accumulates thread counts
+  and reduces them per block before a global atomic update. Output caches also
+  batch global counter reservations, though shared cache insertion uses atomics.
+- **Memory utilization / Using coalesceable global memory accesses:** flushes
+  distribute consecutive output positions across lanes. This is output packing,
+  not input **Shared memory tiling**.
+- **General / Thread coarsening:** each outer-row thread evaluates many inner-row
+  pairs, amortizing outer-row assignment. This increases serial work per thread
+  and does not establish a performance-tuned coarsening factor.
+- **Compute utilization / Reducing control divergence:** compile-time nullability
+  selects expression-handling code, but predicate outcomes still diverge.
+
+This remains quadratic candidate work for a general all-pairs predicate; caching
+does not change that.
 
 **Profiling questions.** Inspect predicate instruction cost, divergence, repeated
 inner-table reads, match density, and shared-memory/occupancy tradeoffs.
@@ -233,6 +335,17 @@ The cache is an output cache, not evidence of input tiling.
 residual expression. See the [`mixed_join` kernel][mixed-kernel] and
 [`mixed_join_count`][mixed-size]. Predicate selectivity and candidate skew determine
 how much work remains after hashing.
+
+**Mixed checklist mapping (source observations).** **Thread coarsening** is visible
+as grid-stride outer-row traversal plus multiple candidate checks per row.
+**Using coalesceable global memory accesses** applies to adjacent input-pair,
+hash-index, and count entries, not irregular bucket reads or differently sized
+output ranges. **Reducing control divergence** benefits from compile-time
+nullability, but variable probe chains and predicates still diverge. Per-thread
+expression scratch occupies shared memory; it does not demonstrate **Shared memory
+tiling** or **Register tiling**. The kernel writes to precomputed offsets rather
+than using the conditional join's warp output cache, so that cache's
+**Warp-level primitives** must not be attributed to this path.
 
 **Study for the join families:** [He et al., Relational Joins on Graphics
 Processors][join-paper]. It is historical/algorithmic background, not a specification
@@ -255,9 +368,20 @@ body to identify in these wrappers.
 [`recurrence_functor<T>::operator()`][ewma]: it composes affine-transform pairs,
 turning the EWMA recurrence into a parallel scan.
 
-**Optimization observations.** Transform iterators avoid separate transformed
-inputs. Prefix computation exposes parallelism despite the apparent sequential
-recurrence. Null-mask processing and EWMA intermediates still add passes/traffic.
+**Checklist mapping (source observations and library boundary).**
+
+- **Memory utilization / Using coalesceable global memory accesses:** numeric
+  inputs/outputs are contiguous ranges supplied to Thrust. Null replacement and
+  count transforms do not require separately materialized value columns.
+- **Compute utilization / Reducing control divergence:** typed operator and
+  null-handling dispatch specialize execution; element validity can still vary.
+- **Warp-level primitives**, **Register tiling**, **Thread coarsening**, and
+  **Double buffering** are possible backend strategies, not established by
+  `inclusive_scan`/`exclusive_scan` at the cuDF call site.
+
+EWMA's affine-pair composition exposes parallelism in the recurrence without
+proving a register tile. Null-mask processing and EWMA intermediates add
+passes/traffic; inspect their backend scans separately.
 
 **Profiling questions.** Measure launch overhead for short columns, traffic for
 long columns, and null-processing overhead. Floating-point regrouping means
@@ -280,10 +404,22 @@ is the `__device__` predicate. The selection kernel is library-owned.
 The [gather implementation][gather] specializes fixed-width, string, list,
 dictionary, and struct data, including a device validity-gather functor.
 
-**Optimization observations.** Counting iterators avoid allocating input row
-indices. Compile-time mask nullability selects the predicate variant.
-Compacting an index map shares selection across columns, at the cost of the
-map and subsequent gather traffic. Selected source locations may be scattered.
+**Checklist mapping (source observations and library boundary).**
+
+- **Compute utilization / Reducing control divergence:** the driver selects
+  `boolean_mask_filter<true>` or `<false>` once according to mask nullability.
+  The non-null case removes validity handling; varying mask values still affect
+  selection work.
+- **Memory utilization / Using coalesceable global memory accesses:** mask
+  evaluation traverses adjacent rows. Fixed-width gather writes a dense output,
+  but selected source rows may be scattered, so input coalescing depends on
+  selectivity and locality.
+- **Warp-level primitives** and **Thread coarsening** for the actual selection
+  kernel are library-owned and need backend evidence.
+
+Counting iterators avoid an allocated input-index array; one compacted map shares
+selection across columns. Neither mechanism establishes **Register tiling** or
+**Shared memory tiling**.
 
 **Profiling questions.** Vary selectivity, table width, row locality, and
 variable-length data. Predicate evaluation may be cheap while gathering strings
@@ -311,10 +447,22 @@ implementations; not every aggregation is a simple sum-like tree reduction.
 **Device entry points.** Reduction operator/transformer functors execute inside
 CUB-owned kernels. A `__device__` finalization lambda handles compound results.
 
-**Optimization observations.** Iterator fusion avoids a temporary cast/null-filled
-column. Hierarchical combination is delegated to CUB. The wrapper first queries
-temporary-storage size, allocates storage, and then executes the reduction;
-the query is not a second full reduction.
+**Checklist mapping (source observations and library boundary).**
+
+- **Memory utilization / Using coalesceable global memory accesses:** ordinary
+  fixed-width reductions expose contiguous element ranges to CUB. Dictionary and
+  nested access can be indirect; iterator fusion avoids a cast/null-filled temporary
+  but does not guarantee every underlying access is coalesced.
+- **Memory utilization / Privatization** and **Synchronization latency /
+  Warp-level primitives** are relevant to hierarchical partial reduction, but the
+  wrapper delegates its implementation to CUB. Verify the selected kernels before
+  claiming a particular thread/warp/block reduction strategy.
+- **Register tiling**, **Loop unrolling**, **Vector loads and stores**, and
+  **Thread coarsening** require dependency/generated-code evidence; the typed
+  operator alone proves none of them.
+
+The wrapper first queries temporary-storage size, allocates storage, and then
+executes the reduction; the query is not a second full reduction.
 
 **Profiling questions.** Examine input bandwidth, operator cost, segment-size
 imbalance, allocation/launch overhead, and output dtype conversions.
@@ -326,9 +474,14 @@ Mean reduces a sum and finalizes using valid count. Variance/std reduce
 Its `CUDF_HOST_DEVICE operator+` merges partial statistics using the pairwise
 Chan-Golub-LeVeque algorithm; this is not naive subtraction of squared sums.
 
-**Optimization observations.** Mergeable statistics expose parallelism while
-improving numerical stability, but increase per-item arithmetic and intermediate
-state relative to sum.
+**Checklist mapping (source observations and library boundary).** Mergeable
+statistics allow partial accumulation, making **Privatization** relevant to the
+CUB reduction as above. The `var_std` sum/deviation/count fields are intermediate
+state, not proof of **Register tiling** or spill-free registers.
+For **Occupancy tuning**, their larger state and arithmetic cost relative to sum
+are resource considerations to measure, not evidence that cuDF explicitly tunes
+this operator's launch. The associative formulation improves parallelism and
+numerical stability independently of the checklist's low-level mechanisms.
 
 **Profiling questions.** Evaluate numerical tolerance as well as throughput;
 operator state can affect register use and arithmetic intensity.
@@ -347,10 +500,21 @@ combination, although its primary subject is scan.
 The [radix implementation][radix] and [sorted-order implementation][radix-order]
 also contain device transformations/decomposers for floating-point ordering.
 
-**Optimization observations.** Fixed-width keys allow bit-oriented sorting
-without arbitrary row-comparator calls. The value-only fast path avoids the
-general permutation-and-gather pipeline. Multiple sorting passes and temporary
-buffers still incur traffic.
+**Checklist mapping (source observations and library boundary).**
+
+- **Compute utilization / Reducing control divergence:** the eligible fixed-width,
+  no-null path avoids arbitrary row-comparator calls and selects sort direction
+  outside the kernel. This does not establish branch-free execution inside CUB.
+- **Memory utilization / Using coalesceable global memory accesses:** contiguous
+  key/index arrays expose a regular input layout, while digit redistribution and
+  temporary traffic are handled by CUB.
+- **Shared memory tiling**, **Register tiling**, **Vector loads and stores**, and
+  **Avoiding shared memory bank conflicts** must be verified in the selected radix
+  kernels. Separate input/output arrays alone are not the checklist's
+  **Double buffering** optimization.
+
+The value-only fast path avoids the general permutation-and-gather pipeline,
+but multiple sorting passes and temporary buffers still incur traffic.
 
 **Profiling questions.** Inspect key width, temporary traffic, input size, and
 floating-point preprocessing; do not assume a fixed pass count without checking CUB.
@@ -366,9 +530,19 @@ value comparisons and null precedence.
 [`device_row_comparator`][row-compare] contains the device-level column and nested
 comparisons. `sort_by_key` then gathers values using the permutation.
 
-**Optimization observations.** Sorting indices avoids repeatedly moving wide
-rows, but comparisons/gathers add indirect accesses. `if constexpr` selects
-stable/unstable code, and nested/non-nested paths specialize comparisons.
+**Checklist mapping (source observations and library boundary).**
+
+- **Compute utilization / Reducing control divergence:** `if constexpr` selects
+  stable/unstable code and separate nested/non-nested comparators specialize
+  execution. This eliminates some choices, not data-dependent lexicographic
+  early exits, null branches, or varying string lengths.
+- **Memory utilization / Using coalesceable global memory accesses:** the index
+  array is contiguous, but permutation-based key reads and final gathers are
+  indirect. Sorting indices reduces wide-row movement without proving coalescing
+  for those key reads.
+- **Loop unrolling**, **Register tiling**, and **Warp-level primitives** in the
+  sorting machinery require CUB/Thrust backend evidence.
+
 Radix paths are stable even when the public operation does not require stability.
 
 **Profiling questions.** Compare early versus late differing key columns,
@@ -381,9 +555,17 @@ Do not infer a fixed comparator-sort backend solely from a Thrust API name.
 `cub::DeviceSegmentedSort`; int128 is excluded from this fast path.
 The general path can incorporate segment identifiers into lexicographic sorting.
 
-**Optimization observations/questions.** Segment size distribution changes available
-parallelism and load balance. Measure metadata generation and temporary copies as
-well as sorting; this path should not be described simply as segmented radix sort.
+**Checklist mapping (source observations and library boundary).**
+**Reducing control divergence** is supported by selecting the eligible fixed-width
+no-null fast path, but segment sizes still vary.
+For **Using coalesceable global memory accesses**, contiguous offsets and arrays
+offer regular storage while segment boundaries complicate work assignment.
+**Occupancy tuning**, **Thread coarsening**, and **Shared memory tiling** inside
+`DeviceSegmentedSort` are delegated to CUB, not established by this wrapper.
+
+**Profiling questions.** Segment size distribution changes available parallelism
+and load balance. Measure metadata generation and temporary copies as well as
+sorting; this path should not be described simply as segmented radix sort.
 
 **Study for sorting:** [Satish, Harris, and Garland, Designing Efficient Sorting
 Algorithms for Manycore GPUs][sort-paper]. It explains GPU radix/merge design
@@ -433,7 +615,7 @@ is needed to establish bottlenecks and tradeoffs.
 [groupby-types]: https://github.com/jazracherif/cudf/blob/e81ad54ed957866c235cf0720fc3ef8986aa39b0/cpp/src/groupby/hash/helpers.cuh#L20-L101
 [groupby-driver]: https://github.com/jazracherif/cudf/blob/e81ad54ed957866c235cf0720fc3ef8986aa39b0/cpp/src/groupby/hash/compute_single_pass_aggs.cuh#L59-L160
 [mapping]: https://github.com/jazracherif/cudf/blob/e81ad54ed957866c235cf0720fc3ef8986aa39b0/cpp/src/groupby/hash/compute_mapping_indices.cuh#L23-L152
-[shared-aggs]: https://github.com/jazracherif/cudf/blob/e81ad54ed957866c235cf0720fc3ef8986aa39b0/cpp/src/groupby/hash/compute_shared_memory_aggs.cu#L172-L264
+[shared-aggs]: https://github.com/jazracherif/cudf/blob/e81ad54ed957866c235cf0720fc3ef8986aa39b0/cpp/src/groupby/hash/compute_shared_memory_aggs.cu#L94-L264
 [global-functors]: https://github.com/jazracherif/cudf/blob/e81ad54ed957866c235cf0720fc3ef8986aa39b0/cpp/src/groupby/hash/single_pass_functors.cuh#L101-L156
 [atomic-aggs]: https://github.com/jazracherif/cudf/blob/e81ad54ed957866c235cf0720fc3ef8986aa39b0/cpp/src/groupby/hash/global_memory_aggregator.cuh#L48-L115
 [groupby-sort]: https://github.com/jazracherif/cudf/blob/e81ad54ed957866c235cf0720fc3ef8986aa39b0/cpp/src/groupby/sort/sort_helper.cu#L80-L195
@@ -481,3 +663,5 @@ is needed to establish bottlenecks and tradeoffs.
 [join-paper]: https://doi.org/10.1145/1376616.1376670
 [variance-paper]: https://doi.org/10.1080/00031305.1983.10483115
 [sort-paper]: https://mgarland.org/files/papers/gpusort-ipdps09.pdf
+[checklist-comment]: https://github.com/jazracherif/cudf/pull/1#discussion_r4331173782
+[checklist-image]: https://github.com/user-attachments/assets/f6c559f0-2b28-4a06-babc-60b9a06367a1
