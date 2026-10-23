@@ -1,0 +1,428 @@
+cuDF Kernel Explorer — website design proposal
+=============================================
+
+Status: DESIGN ONLY. No website, executable examples, profiler integration,
+dependencies, or execution service is introduced by this document.
+
+Source guide:
+/home/runner/work/cudf/cudf/docs/cudf/relational-kernels/README.md
+
+Analysis baseline: cuDF source revision
+e81ad54ed957866c235cf0720fc3ef8986aa39b0.
+The README's pinned citations are the evidence catalog for the proposed site.
+The supplied PMPP Figure 6.13 image confirms the checklist taxonomy already
+transcribed in that guide.
+
+1. Product goal and audience
+---------------------------
+
+Help a reader answer four questions without knowing the repository beforehand:
+  • What algorithm implements this relational operation?
+  • Why is that algorithm selected for these inputs?
+  • What host calls, device functions, and kernel stages perform the work?
+  • Which code, optimization mechanisms, and papers should I study next?
+
+Target readers know intermediate C++ but may be new to CUDA and cuDF.
+The primary journey is operation → algorithm → execution sequence → source.
+Examples and papers are linked learning paths, not disconnected catalogs.
+
+Keep the default experience explanatory, not an IDE or a profiler dashboard.
+Use progressive disclosure: a plain-language overview first, exact signatures,
+dispatch conditions, template parameters, and source excerpts on demand.
+
+2. Information architecture
+--------------------------
+
+Persistent navigation:
+  Explore operations | Example lab | Papers | Code-reading guide
+
+Operation sidebar, always available on the exploration screen:
+  Group by
+  Join
+  Scan
+  Filter / stream compaction
+  Reduction
+  Sorting
+
+Secondary controls:
+  • Search operation, API, symbol, paper, or PMPP optimization.
+  • Visible source-revision badge; dependency-revision status beside it.
+  • Breadcrumb: Join / Hash equijoin / Probe and retrieve.
+  • Shareable URL that preserves operation, variant, selected stage, example,
+    and content revision. Browser back/forward restores that learning context.
+
+Home screen:
+  • Six operation cards, each with one sentence and a familiar task.
+  • "Start with an example" and "How to read CUDA code" entry points.
+  • A brief legend distinguishing host code, launchable kernels, device helpers,
+    and dependency primitives.
+  • No requirement to choose hardware, install cuDF, or run code.
+
+3. Main exploration screen
+-------------------------
+
+Desktop layout, expressed as a wireframe rather than an implementation:
+
+  [cuDF Kernel Explorer] [Search…] [Source revision] [Help]
+  ------------------------------------------------------------------
+  Operations      | Group by > Hash aggregation                     |
+  • Group by      | What it computes • Why this path is selected    |
+    Join          | [Algorithm variant] [Example] [Compare paths]    |
+    Scan          |                                                  |
+    Filter        | Execution sequence                               |
+    Reduction     | [Prepare] → [Map groups] → [Aggregate] → [Output] |
+    Sorting       |              ↘ conditional fallback              |
+                  |                                                  |
+                  | Selected stage: Map groups                       |
+                  | [Explanation | Source | PMPP | Papers]           |
+                  | Symbol, execution space, inputs/outputs, source  |
+  ------------------------------------------------------------------
+
+A selected-stage inspector stays beneath the sequence, not in a third mandatory
+column. This keeps code readable on ordinary laptop widths. A source excerpt
+may expand into a full-width drawer while retaining the stage breadcrumb.
+
+Each operation begins with:
+  • Plain-language semantics and a small input/output illustration.
+  • Available algorithm variants and the source-backed dispatch decision.
+  • Whether the result is values, a scalar, a permutation, or join index pairs.
+  • Links to exact public signatures, not only simplified API labels.
+  • A visible distinction between a manually selected algorithm for study and
+    the path a particular API is known to dispatch to.
+
+On narrow screens, replace the sidebar with an operation picker and render the
+sequence vertically. Code remains horizontally scrollable without making the
+whole page scroll sideways.
+
+4. Execution sequence: stages are not necessarily individual kernels
+-------------------------------------------------------------------
+
+The central view is an ordered stage graph, with an accessible ordered-list
+equivalent. Read left to right on desktop, top to bottom on mobile.
+
+Each node has:
+  • Short action name and purpose.
+  • Kind badge: HOST, CUDF KERNEL, DEVICE HELPER, or LIBRARY PRIMITIVE.
+  • Owner: cuDF, CUB, Thrust, or cuCollections.
+  • Exact symbol/signature and pinned source location where known.
+  • Input/output artifacts: keys, row map, group labels, counts, offsets, etc.
+  • Evidence badge and optional dispatch guard.
+
+Device helpers are expandable children of their calling kernel/primitive, not
+separate launches. A library primitive may launch multiple kernels. Until the
+specific dependency implementation is verified, show an opaque expandable node
+labelled "library kernel sequence not yet resolved"; never invent launch names.
+
+Branches show guards such as nullability, fixed-width eligibility, sortedness,
+aggregation support, shared-memory compatibility, and cardinality fallback.
+Selecting an example highlights applicable known branches. Unknown conditions
+remain explicitly unresolved. Show fast paths, empty-input exits, optional
+count passes, and preprocessing reuse where established by the guide.
+
+Do not draw all stages as simultaneous or claim elapsed time from their widths.
+The default graph describes logical/source-derived order, not a CUDA trace.
+Future traces may add actual launches, stream lanes, repetitions, and timing.
+
+5. Initial algorithm coverage
+-----------------------------
+
+The sequences below are educational stage skeletons from the README. They are
+not claimed to be exhaustive launch traces. Expand each node only with evidence.
+
+Operation       Variants and sequence to expose
+---------------------------------------------------------------------------
+Group by        Hash: key preparation → mapping_indices_kernel →
+                shared aggregation → result finalization/materialization.
+                Show the guarded global-memory aggregation fallback.
+                Expand find_local_mapping/find_global_mapping under mapping;
+                expand single_pass_shmem_aggs_kernel and atomic aggregators.
+                Sort: key permutation → boundaries/labels → grouped values →
+                reduce_by_key; grouped scan uses inclusive_scan_by_key.
+
+Join            General hash: build preparation → cuCollections insertion →
+                optional match count → retrieve/retrieve_outer → index pairs.
+                Full join additionally appends the unmatched-build complement.
+                Distinct: build → find/find_if → result indices.
+                Mark semi/anti: mark probe → mark retrieval/compaction;
+                include clearing marks when the selected reuse path needs it.
+                Sort-merge: sorted orders → bounds searches → match counts →
+                scanned offsets → range expansion.
+                Conditional: AST preparation → size pass → nested-loop output.
+                Mixed: equality candidate preparation → residual-predicate
+                count → output offsets → candidate retrieval with predicate.
+
+Scan            Operator/null handling → inclusive/exclusive scan → validity.
+                Display validity handling in its source-established position,
+                not as a universal final kernel.
+                EWMA: recurrence-pair transforms → scans → finalization.
+
+Filter          Boolean-mask predicate → copy_if of row indices → gather.
+                Reveal validity handling and nested-column gather expansion;
+                empty/all-selected paths avoid the general gather pipeline.
+
+Reduction       Typed transform/null replacement → CUB reduction → validity.
+                Segmented: supplied offsets → segmented reduction.
+                Mean/variance/std: intermediate-state reduction → finalization.
+                Explain the Chan–Golub–LeVeque merge operator under variance.
+
+Sorting         Eligible value-only path: radix preprocessing as needed →
+                SortKeys → output; sorted_order uses SortPairs with indices.
+                Single-column comparator path: DeviceMergeSort over indices.
+                Multi-column/nested: lexicographic comparison sort → permutation
+                → optional gather. Segmented: eligible DeviceSegmentedSort or
+                general segment-identifier/comparator route.
+---------------------------------------------------------------------------
+
+Selecting a node can highlight its producer/consumer artifacts. Small illustrative
+tables explain "counts become offsets" or "indices become gathered rows" without
+pretending to simulate GPU execution.
+
+6. Source inspector and the "stack of code"
+-----------------------------------------
+
+Interpret "stack" as a navigable code-path stack, not a fabricated runtime
+backtrace. Default label: "Source-derived code path — not captured at runtime."
+
+Display collapsible levels:
+  1. User example: Python cuDF or direct C++ libcudf.
+  2. Python/pylibcudf binding boundary, if verified for that example.
+  3. Public libcudf signature and host validation.
+  4. Internal dispatch and driver.
+  5. Kernel launch or dependency primitive.
+  6. __global__/CUDF_KERNEL body, when resolved.
+  7. __device__/CUDF_HOST_DEVICE operator/helper.
+
+Do not invent Python binding frames from the C++ guide. Mark unverified levels
+"mapping pending"; direct C++ examples are the initial reliable starting point.
+An editor selection on the example chooses the relevant operation's path.
+Clicking a frame opens its source excerpt and highlights the corresponding stage.
+
+Excerpt presentation:
+  • Symbol, signature, execution space, file, line numbers, revision, owner.
+  • Small focused excerpt with expandable surrounding context.
+  • "Open pinned source" link and a plain-language explanation.
+  • Notes for dependent template syntax, dispatch, CRTP, views, and lifetimes
+    linked to the code-reading guide.
+  • Distinguish actual excerpt, explanatory pseudocode, and proposed example.
+  • Do not label a host wrapper as a kernel just because it resides in a .cu file.
+
+A missing dependency revision or symbol is an explanatory state, not a broken
+blank panel. Third-party source excerpts require attribution/license review
+before inclusion; links can remain available without copied source.
+
+7. Example lab: read now, run later
+---------------------------------
+
+Design the lab around curated examples, not an unrestricted browser terminal.
+This design does not implement, compile, or execute examples.
+
+Each example card contains:
+  • Learning goal, language, proposed expression/API, deterministic input.
+  • Dtypes/null policy and other inputs that affect dispatch.
+  • Expected semantic output and assertions to validate later.
+  • Source-derived algorithm candidates, evidence status, and code-path stack.
+  • Version/environment requirements and execution status "Not run".
+  • Read-only code-preview area in the first website release.
+  • No active "Run" control until a separately designed runner exists.
+
+Initial example specifications:
+
+  A. Grouped sum
+     Task: group keys [2, 1, 2, 1] and int64 values [10, 20, 30, 40].
+     Expected mapping: key 1 → 60, key 2 → 40; ignore unspecified output order.
+     Proposed API: C++ groupby::aggregate with SUM.
+     Path: aggregate → dispatch_aggregation → hash or sort driver.
+     Lesson: algorithm dispatch versus data-dependent shared/global hash path.
+     Do not claim this tiny input guarantees a shared-memory launch.
+
+  B. Duplicate-key inner join
+     Left keys [1, 2, 2]; right keys [2, 2, 3], with no nulls.
+     Expected index-pair set: (1,0), (1,1), (2,0), (2,1).
+     Proposed API: C++ inner_join.
+     Path: public join → hash build → count/retrieve → index pairs.
+     Lesson: many-to-many expansion; compare results as unordered pairs.
+
+  C. Inclusive sum scan
+     Int64 values [3, 1, 4, 2]; expected [3, 4, 8, 10].
+     Proposed API: scan with SUM, INCLUSIVE, nulls excluded.
+     Path: scan dispatch → typed operator → Thrust scan.
+     Lesson: prefix computation is not a table read; compare exclusive output.
+
+  D. Boolean filter
+     Int64 values [10, 20, 30, 40]; mask [true, false, null, true].
+     Expected [10, 40].
+     Proposed API: apply_boolean_mask.
+     Path: boolean_mask_filter → copy_if indices → gather.
+     Lesson: null mask values do not select rows; selection and copying differ.
+
+  E. Variance
+     Floating values [1, 2, 3, 4], ddof=1; expected approximately 5/3.
+     Proposed API: reduce with variance aggregation and floating output.
+     Path: typed compound reduction → var_std merge → finalization.
+     Lesson: pairwise statistics, tolerance-based checks, and the cited paper.
+
+  F. Sorting permutation
+     Non-null int32 keys [30, 10, 20]; ascending permutation [1, 2, 0].
+     Proposed API: sorted_order on a one-column table.
+     Path: single-column dispatch → SortPairs radix primitive → indices.
+     Lesson: compare with sorting values, nullable comparison, and multi-key sort.
+
+The implemented site would supply complete self-contained snippets, including
+imports or C++ setup and result checks. These specifications are not runnable
+code and are not labelled tested. Start with one operation per snippet; later
+add a filter → group by → sort example whose selected expression links to its
+own operation sequence. Verify Python-layer mappings before offering that path.
+
+Editable knobs should initially select pre-authored scenarios (nullable, sorted,
+duplicate-heavy), not pretend to recompute an exact dispatch from arbitrary code.
+Direct libcudf examples can expose algorithms not automatically selected by
+Python APIs; present that distinction clearly.
+
+8. PMPP optimization view
+------------------------
+
+Use exactly the four supplied categories:
+  Compute utilization; Memory utilization; Synchronization latency; General.
+
+Include all 12 optimization names from Figure 6.13. Each optimization card has
+the benefits/strategies from the guide, a short explanation, linked stage/symbol,
+and an evidence label:
+  • Observed in cuDF source.
+  • Dependency implementation needs verification.
+  • Profiling question, not demonstrated.
+
+Examples: group-by privatization and occupancy-aware launch sizing; mark-join
+warp primitives/unrolling; conditional-join output packing; reduction backend
+strategies whose exact implementation remains unresolved.
+
+Never turn missing evidence into "optimization absent." Explain why shared
+scratch is not necessarily shared-memory tiling, local state is not proof of
+register tiling, and two buffers are not proof of double buffering.
+No performance scores, speedup estimates, or synthetic utilization meters.
+
+9. Papers and reading journeys
+------------------------------
+
+Each algorithm has a Papers tab. Each paper page links back to all relevant
+algorithms, examples, and code symbols. Show title, authors, year, canonical link,
+one-paragraph takeaway, and "what to inspect in code after reading."
+
+Initial reading set, using the README's existing links:
+  • Blelloch — Prefix Sums and Their Applications:
+    scans, EWMA, grouped scan and compaction foundations.
+  • Merrill and Garland — Decoupled Look-back:
+    modern scan background; do not claim an exact backend without verification.
+  • He et al. — Relational Joins on Graphics Processors:
+    join-family background, not the current hash-table specification.
+  • Chan, Golub, and LeVeque — Sample Variance:
+    explicit implementation citation and pairwise-statistics code connection.
+  • Satish, Harris, and Garland — Manycore GPU Sorting:
+    radix/merge design background, not current CUB kernel attribution.
+  • GPU Gems 3, Chapter 39:
+    introductory tutorial, visibly classified separately from research papers.
+
+Distinguish "explicitly cited by source" from "recommended background."
+Include the PMPP checklist as a textbook learning resource, not a research paper.
+Do not embed paywalled full texts or make access a prerequisite for navigation.
+
+10. Proposed content model and implementation boundary
+------------------------------------------------------
+
+Design for a static, read-only content-driven site first. No frontend framework
+or dependency is selected at this stage. A build-time search index and locally
+available source excerpts can support exploration without GitHub access per click.
+GitHub remains the canonical full-source destination.
+
+Conceptual records (not a schema implementation):
+  Operation: semantics, APIs, output kind, supported algorithm variants.
+  Algorithm: dispatch conditions, stage graph, caveats, examples, papers.
+  Stage: kind, owner, symbol/source IDs, artifacts, guards, evidence.
+  Source reference: repository, commit, file, lines, symbol, dependency version.
+  Example: language, scenario, input, expected results, source-path mappings.
+  Optimization evidence: PMPP item, stage/symbol, observation, limitations.
+  Paper: bibliographic identity, URL, takeaway, citation relationship.
+  Future trace: environment, example revision, launches, stream order, timestamps.
+
+Use stable IDs so the same CUB primitive, paper, or helper is not copied into
+several conflicting records. Keep assertions attached to source revision and
+evidence, not just prose. Preserve README section/symbol references as provenance.
+Review content manually when revisions change rather than silently substituting
+latest source into an old explanation.
+
+The design's operation-level sequences are initial editorial content. Validating
+binding paths and resolving library-owned launches are future content work, not
+features assumed to exist merely because these records can represent them.
+
+11. Future execution and trace boundary
+---------------------------------------
+
+Reserve a future "Captured execution" view alongside "Source-derived path."
+A real run must record cuDF/CUDA/dependency versions, GPU, dtype/null settings,
+input shape/distribution, stream information, and the exact example revision.
+Correlate launches with operation regions; asynchronous host call stacks are not
+the device call stack, and device helpers may be inlined rather than separate
+trace frames. Keep unmatched launches visible with uncertainty, not false matches.
+
+Any future runner requires separate approval/design for GPU availability,
+isolation, authentication if hosted, restricted filesystem/network access,
+resource quotas, timeouts, cancellation, and cleanup. Start with trusted curated
+examples; do not execute arbitrary pasted code in a documentation backend.
+Browser users must not supply GitHub tokens or cloud credentials for browsing.
+Imported traces must be treated as untrusted data and screened for sensitive paths.
+
+Design phase: no timing, execution success, or captured-stack claims.
+Initial website: browsing and code previews only.
+Later phase: validated local examples, then optional trace import.
+A hosted execution service is not required for the learning experience.
+
+12. Interaction, accessibility, and empty states
+-----------------------------------------------
+
+  • Keyboard navigation and visible focus for sidebar, stages, tabs, and source.
+  • Text labels/icons as well as colors for execution kind and evidence status.
+  • Semantic headings and an ordered text alternative to every graph.
+  • Expand/collapse without losing selection; no essential hover-only details.
+  • Clear/undo for filters and a "return to overview" action.
+  • Explanatory states for no search matches, unsupported variants, unresolved
+    dependency bodies, unavailable source excerpts, and not-yet-run examples.
+  • Long signatures wrap separately from code; copy controls retain exact text.
+  • Optional animations respect reduced-motion preferences.
+  • Algorithm comparison shows aligned stages and differing guards side by side,
+    not an unexplained node graph or an unsupported performance ranking.
+
+13. Design review and implementation plan
+-----------------------------------------
+
+Design approval should settle:
+  • Whether the initial lab should prioritize direct C++ (stronger existing
+    evidence) or verified Python bindings (more familiar user experience).
+  • Whether static source excerpts and links are enough for the first website.
+  • Which dependency revision(s) should be resolved before showing launch bodies.
+
+Proposed implementation sequence after approval:
+  1. Curate revisioned operation/stage/source/paper records from the guide.
+  2. Validate source paths, dispatch guards, and excerpt attribution.
+  3. Build the shell, six operation pages, stage inspector, and deep links.
+  4. Add source-path stacks, read-only example previews, and paper cross-links.
+  5. Add PMPP evidence filters, algorithm comparison, and code-reading help.
+  6. Conduct accessibility and learning-task review before any execution features.
+  7. Separately validate runnable examples and design trace collection/import.
+
+Acceptance criteria for the proposed first website:
+  • A new reader can find an operation and explain its output/algorithm choice.
+  • All six operation families have selectable algorithm variants and stage order.
+  • Each stage exposes its owner, kind, source evidence, and inputs/outputs.
+  • Device helpers cannot be mistaken for independent launches; unresolved library
+    stages cannot be mistaken for measured or exhaustive kernel sequences.
+  • Selecting an example exposes the corresponding source-derived code path.
+  • All six example specifications have deterministic inputs and output checks;
+    previews remain explicitly unexecuted until validated.
+  • Every algorithm has relevant reading or an explicit "background only" state.
+  • PMPP observations are linked to code and separated from profiling questions.
+  • Shared URLs restore context and the full journey works by keyboard/mobile.
+  • No GPU, login, external credential, or live runner is required to learn.
+
+Design deliverable acceptance:
+  This standalone document describes the screens, content relationships, sample
+  scenarios, constraints, and review criteria. Approval authorizes a subsequent
+  implementation task, not code execution or a hosted service in this task.
